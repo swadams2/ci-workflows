@@ -1,0 +1,242 @@
+# Install a Python project the way a new user would (fresh venv, no caches), then run its
+# tests against that install. Report-only: it never blocks a push.
+#
+# Modes:
+#   package  build the wheel (what pip builds for a git-URL install), install it with
+#            `extras` into a fresh venv, run the tests from a copy outside the source tree
+#            so the source dir can't shadow site-packages.
+#   source   fresh venv with only `test-requirements`, tests run in the tree (repos that
+#            aren't installable by their users, e.g. a private dependency).
+#
+# Git LFS: with `lfs: true`, one job fetches the objects and caches them per object set; the
+# matrix restores that cache and checks out offline, so LFS bandwidth is spent once per change.
+#
+# Caller usage and inputs: HAL commands/dev/clean-install-ci.md
+
+name: clean-install
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "package | source"
+        type: string
+        default: package
+      extras:
+        description: "Comma-separated extras for the package install, e.g. classifier,pii"
+        type: string
+        default: ""
+      test-requirements:
+        description: "Space-separated pip requirements the tests need"
+        type: string
+        default: pytest
+      python-versions:
+        description: "JSON list: the declared minimum and the newest supported"
+        type: string
+        default: '["3.10", "3.14"]'
+      os:
+        description: "JSON list of runners for branch pushes"
+        type: string
+        default: '["ubuntu-latest", "windows-latest"]'
+      tag-os:
+        description: "JSON list of runners for tag pushes"
+        type: string
+        default: '["ubuntu-latest", "windows-latest", "macos-latest"]'
+      lfs:
+        type: boolean
+        default: false
+      test-dir:
+        description: "Test directory copied out of the tree (package mode)"
+        type: string
+        default: tests
+      pytest-args:
+        type: string
+        default: "-q"
+      git-install-on-tag:
+        description: "On tags, also pip install from the git URL at the tag (package mode)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Never let a checkout pull LFS objects implicitly; every download below is deliberate.
+  GIT_LFS_SKIP_SMUDGE: "1"
+
+jobs:
+  lfs:
+    if: inputs.lfs
+    name: fetch + cache Git LFS objects
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      key: ${{ steps.ids.outputs.key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+      - id: ids
+        shell: bash
+        run: |
+          git -C src lfs ls-files --long | cut -d' ' -f1 | sort > lfs-ids.txt
+          echo "LFS objects: $(wc -l < lfs-ids.txt)"
+          echo "key=lfs-$(sha256sum lfs-ids.txt | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src/.git/lfs/objects
+          key: ${{ steps.ids.outputs.key }}
+          enableCrossOsArchive: true
+      - name: Fetch LFS objects (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          lfs: true
+          persist-credentials: false
+
+  test:
+    needs: lfs
+    if: ${{ !cancelled() && (needs.lfs.result == 'success' || needs.lfs.result == 'skipped') }}
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(startsWith(github.ref, 'refs/tags/') && inputs.tag-os || inputs.os) }}
+        python: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Windows users' default line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+      - if: inputs.lfs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src/.git/lfs/objects
+          key: ${{ needs.lfs.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Check out LFS files offline
+        if: inputs.lfs
+        run: |
+          git -C src lfs checkout
+          if git -C src lfs ls-files | grep -q ' - '; then
+            echo "::error::LFS pointer files remain after checkout:"
+            git -C src lfs ls-files | grep ' - '
+            exit 1
+          fi
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Fresh venv
+        run: |
+          python -m venv .ci-venv
+          if [ "$RUNNER_OS" = Windows ]; then py=.ci-venv/Scripts/python.exe; else py=.ci-venv/bin/python; fi
+          echo "CI_PY=$PWD/$py" >> "$GITHUB_ENV"
+          "$PWD/$py" -m pip install --no-cache-dir --upgrade pip
+      - name: Build the wheel and install it with extras
+        if: inputs.mode == 'package'
+        env:
+          EXTRAS: ${{ inputs.extras }}
+        run: |
+          "$CI_PY" -m pip wheel ./src --no-deps --no-cache-dir -w dist
+          wheels=(dist/*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got: ${wheels[*]}"; exit 1; }
+          spec="${wheels[0]}"
+          [ -z "$EXTRAS" ] || spec="${spec}[${EXTRAS}]"
+          "$CI_PY" -m pip install --no-cache-dir "$spec"
+          "$CI_PY" -m pip check
+      - name: Install test requirements
+        env:
+          TEST_REQUIREMENTS: ${{ inputs.test-requirements }}
+        run: |
+          read -ra reqs <<< "$TEST_REQUIREMENTS"
+          [ ${#reqs[@]} -eq 0 ] || "$CI_PY" -m pip install --no-cache-dir "${reqs[@]}"
+      - name: Test the installed package (from outside the source tree)
+        if: inputs.mode == 'package'
+        env:
+          TEST_DIR: ${{ inputs.test-dir }}
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+        run: |
+          mkdir suite
+          cp -r "src/$TEST_DIR" "suite/$TEST_DIR"
+          for f in pyproject.toml pytest.ini setup.cfg tox.ini conftest.py; do
+            if [ -f "src/$f" ]; then cp "src/$f" suite/; fi
+          done
+          cd suite
+          read -ra args <<< "$PYTEST_ARGS"
+          "$CI_PY" -m pytest -p no:cacheprovider "${args[@]}"
+      - name: Test in the source tree
+        if: inputs.mode == 'source'
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+        run: |
+          cd src
+          read -ra args <<< "$PYTEST_ARGS"
+          "$CI_PY" -m pytest -p no:cacheprovider "${args[@]}"
+
+  git-install:
+    if: inputs.git-install-on-tag && inputs.mode == 'package' && startsWith(github.ref, 'refs/tags/')
+    name: git-URL install at ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+      - name: Read the distribution name
+        # Runner's system Python (3.12) has tomllib; the matrix minimum may not.
+        run: |
+          name=$(/usr/bin/python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["name"])' src/pyproject.toml)
+          echo "DIST_NAME=$name" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ fromJSON(inputs.python-versions)[0] }}
+      - name: pip install from the git URL, as a user would
+        env:
+          EXTRAS: ${{ inputs.extras }}
+          TOKEN: ${{ github.token }}
+        run: |
+          unset GIT_LFS_SKIP_SMUDGE
+          git lfs install
+          # Private repos: let pip's git clone (and git-lfs) authenticate; removed on exit.
+          rewrite="url.https://x-access-token:${TOKEN}@github.com/"
+          git config --global "${rewrite}.insteadOf" "https://github.com/"
+          trap 'git config --global --remove-section "$rewrite"' EXIT
+          python -m venv .ci-venv
+          extras=""
+          [ -z "$EXTRAS" ] || extras="[${EXTRAS}]"
+          .ci-venv/bin/python -m pip install --no-cache-dir --upgrade pip
+          .ci-venv/bin/python -m pip install --no-cache-dir \
+            "${DIST_NAME}${extras} @ git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
+          .ci-venv/bin/python -m pip check
+      - name: Test the git-installed package
+        env:
+          TEST_REQUIREMENTS: ${{ inputs.test-requirements }}
+          TEST_DIR: ${{ inputs.test-dir }}
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+        run: |
+          read -ra reqs <<< "$TEST_REQUIREMENTS"
+          [ ${#reqs[@]} -eq 0 ] || .ci-venv/bin/python -m pip install --no-cache-dir "${reqs[@]}"
+          mkdir suite
+          cp -r "src/$TEST_DIR" "suite/$TEST_DIR"
+          for f in pyproject.toml pytest.ini setup.cfg tox.ini conftest.py; do
+            if [ -f "src/$f" ]; then cp "src/$f" suite/; fi
+          done
+          cd suite
+          read -ra args <<< "$PYTEST_ARGS"
+          ../.ci-venv/bin/python -m pytest -p no:cacheprovider "${args[@]}"
