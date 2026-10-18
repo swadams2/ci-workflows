@@ -11,6 +11,11 @@
 # Git LFS: with `lfs: true`, one job fetches the objects and caches them per object set; the
 # matrix restores that cache and checks out offline, so LFS bandwidth is spent once per change.
 #
+# Private GitHub dependencies: list them in `private-deps` and pass a read-only deploy key as the
+# `private-deps-ssh-key` secret. One job builds their wheels (with LFS) and caches them per resolved
+# commit; the matrix installs the cached wheels, so LFS bandwidth is spent once per dependency
+# commit. Every job rewrites only those repos' URLs to SSH, with GitHub's host keys pinned.
+#
 # Caller usage and inputs: HAL commands/dev/clean-install-ci.md
 
 name: clean-install
@@ -60,6 +65,14 @@ on:
         description: "On tags, also pip install from the git URL at the tag (package mode)"
         type: boolean
         default: false
+      private-deps:
+        description: "Space-separated private GitHub deps, each git+https://github.com/OWNER/REPO.git@REF (needs the private-deps-ssh-key secret)"
+        type: string
+        default: ""
+    secrets:
+      private-deps-ssh-key:
+        description: "Read-only deploy key (private half) that can read every repo in private-deps"
+        required: false
 
 permissions:
   contents: read
@@ -102,9 +115,107 @@ jobs:
           lfs: true
           persist-credentials: false
 
+  private-deps:
+    if: inputs.private-deps != ''
+    name: build + cache private dependency wheels
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      key: ${{ steps.ids.outputs.key }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Same step in every job that needs the private deps (keep the copies identical).
+      - name: SSH access to the private dependencies
+        env:
+          SSH_KEY: ${{ secrets.private-deps-ssh-key }}
+          PRIVATE_DEPS: ${{ inputs.private-deps }}
+        run: |
+          [ -n "$SSH_KEY" ] || { echo "::error::private-deps is set but the private-deps-ssh-key secret is empty"; exit 1; }
+          dir="$(cd "$RUNNER_TEMP" && pwd)/private-deps-ssh"
+          mkdir -p "$dir" && chmod 700 "$dir"
+          (umask 077 && printf '%s\n' "$SSH_KEY" > "$dir/key")
+          # GitHub's published SSH host keys (api.github.com/meta), pinned: no trust on first use.
+          {
+            echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            echo "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg="
+          } > "$dir/known_hosts"
+          ssh_cmd="ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+          echo "GIT_SSH_COMMAND=$ssh_cmd" >> "$GITHUB_ENV"
+          read -ra urls <<< "$PRIVATE_DEPS"
+          for url in "${urls[@]}"; do
+            re='^git\+https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\.git@[A-Za-z0-9_./-]+$'
+            [[ "$url" =~ $re ]] || { echo "::error::private-deps entry must be git+https://github.com/OWNER/REPO.git@REF: $url"; exit 1; }
+            repo="${BASH_REMATCH[1]}"
+            # Only this repo's exact .git URL goes over SSH (".git" stops a prefix match on REPO-other).
+            git config --global "url.git@github.com:${repo}.git.insteadOf" "https://github.com/${repo}.git"
+            GIT_SSH_COMMAND="$ssh_cmd" git ls-remote "https://github.com/${repo}.git" HEAD > /dev/null \
+              || { echo "::error::the deploy key cannot read ${repo}"; exit 1; }
+          done
+      - id: ids
+        name: Key the cache on the resolved commits
+        env:
+          PRIVATE_DEPS: ${{ inputs.private-deps }}
+        run: |
+          read -ra urls <<< "$PRIVATE_DEPS"
+          : > resolved.txt
+          for url in "${urls[@]}"; do
+            repo_url="${url#git+}"; ref="${repo_url##*@}"; repo_url="${repo_url%@*}"
+            if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "$url $ref" >> resolved.txt
+            else
+              lines=$(git ls-remote "$repo_url" "$ref" "${ref}^{}" "refs/tags/${ref}^{}" | sort)
+              [ -n "$lines" ] || { echo "::error::ref ${ref} not found in ${repo_url}"; exit 1; }
+              printf '%s\n%s\n' "$url" "$lines" >> resolved.txt
+            fi
+          done
+          cat resolved.txt
+          echo "key=private-wheels-v1-$(sha256sum resolved.txt | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: private-wheels
+          key: ${{ steps.ids.outputs.key }}
+          enableCrossOsArchive: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ fromJSON(inputs.python-versions)[0] }}
+      - name: Build the wheels with LFS content (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          PRIVATE_DEPS: ${{ inputs.private-deps }}
+        run: |
+          unset GIT_LFS_SKIP_SMUDGE
+          git lfs install
+          read -ra urls <<< "$PRIVATE_DEPS"
+          for url in "${urls[@]}"; do
+            python -m pip wheel --no-deps --no-cache-dir -w private-wheels "$url"
+          done
+          # One wheel serves every OS in the matrix, so it must be pure; and an LFS pointer file in
+          # place of real content means smudge didn't run.
+          python - private-wheels <<'PY'
+          import pathlib, sys, zipfile
+          bad = []
+          for wheel in pathlib.Path(sys.argv[1]).glob("*.whl"):
+              if not wheel.name.endswith("-none-any.whl"):
+                  bad.append(f"{wheel.name}: not a pure wheel")
+              with zipfile.ZipFile(wheel) as zf:
+                  for member in zf.infolist():
+                      if zf.open(member).read(64).startswith(b"version https://git-lfs.github.com/spec/"):
+                          bad.append(f"{wheel.name}: LFS pointer {member.filename}")
+          for line in bad:
+              print(f"::error::{line}")
+          sys.exit(1 if bad else 0)
+          PY
+
   test:
-    needs: lfs
-    if: ${{ !cancelled() && (needs.lfs.result == 'success' || needs.lfs.result == 'skipped') }}
+    needs: [lfs, private-deps]
+    if: >-
+      ${{ !cancelled()
+      && (needs.lfs.result == 'success' || needs.lfs.result == 'skipped')
+      && (needs.private-deps.result == 'success' || needs.private-deps.result == 'skipped') }}
     name: ${{ matrix.os }} / py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -149,6 +260,60 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then py=.ci-venv/Scripts/python.exe; else py=.ci-venv/bin/python; fi
           echo "CI_PY=$PWD/$py" >> "$GITHUB_ENV"
           "$PWD/$py" -m pip install --no-cache-dir --upgrade pip
+      # Same step in every job that needs the private deps (keep the copies identical).
+      - name: SSH access to the private dependencies
+        if: inputs.private-deps != ''
+        env:
+          SSH_KEY: ${{ secrets.private-deps-ssh-key }}
+          PRIVATE_DEPS: ${{ inputs.private-deps }}
+        run: |
+          [ -n "$SSH_KEY" ] || { echo "::error::private-deps is set but the private-deps-ssh-key secret is empty"; exit 1; }
+          dir="$(cd "$RUNNER_TEMP" && pwd)/private-deps-ssh"
+          mkdir -p "$dir" && chmod 700 "$dir"
+          (umask 077 && printf '%s\n' "$SSH_KEY" > "$dir/key")
+          # GitHub's published SSH host keys (api.github.com/meta), pinned: no trust on first use.
+          {
+            echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            echo "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg="
+          } > "$dir/known_hosts"
+          ssh_cmd="ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+          echo "GIT_SSH_COMMAND=$ssh_cmd" >> "$GITHUB_ENV"
+          read -ra urls <<< "$PRIVATE_DEPS"
+          for url in "${urls[@]}"; do
+            re='^git\+https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\.git@[A-Za-z0-9_./-]+$'
+            [[ "$url" =~ $re ]] || { echo "::error::private-deps entry must be git+https://github.com/OWNER/REPO.git@REF: $url"; exit 1; }
+            repo="${BASH_REMATCH[1]}"
+            # Only this repo's exact .git URL goes over SSH (".git" stops a prefix match on REPO-other).
+            git config --global "url.git@github.com:${repo}.git.insteadOf" "https://github.com/${repo}.git"
+            GIT_SSH_COMMAND="$ssh_cmd" git ls-remote "https://github.com/${repo}.git" HEAD > /dev/null \
+              || { echo "::error::the deploy key cannot read ${repo}"; exit 1; }
+          done
+      - if: inputs.private-deps != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: private-wheels
+          key: ${{ needs.private-deps.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Install the private dependency wheels
+        if: inputs.private-deps != ''
+        # Installed first, so a dependency on the same git URL is already satisfied; pip still
+        # clones it for metadata, and GIT_LFS_SKIP_SMUDGE keeps that clone cheap.
+        run: |
+          "$CI_PY" -m pip install --no-cache-dir private-wheels/*.whl
+          "$CI_PY" - private-wheels <<'PY'
+          import importlib.metadata as md, pathlib, sys
+          bad = []
+          for wheel in pathlib.Path(sys.argv[1]).glob("*.whl"):
+              dist = md.distribution(wheel.name.split("-")[0])
+              for f in dist.files or []:
+                  path = pathlib.Path(str(f.locate()))
+                  if path.is_file() and path.open("rb").read(64).startswith(b"version https://git-lfs.github.com/spec/"):
+                      bad.append(f"{dist.metadata['Name']}: LFS pointer {f}")
+          for line in bad:
+              print(f"::error::{line}")
+          sys.exit(1 if bad else 0)
+          PY
       - name: Build the wheel and install it with extras
         if: inputs.mode == 'package'
         env:
@@ -204,6 +369,34 @@ jobs:
         with:
           path: src
           persist-credentials: false
+      # Same step in every job that needs the private deps (keep the copies identical).
+      - name: SSH access to the private dependencies
+        if: inputs.private-deps != ''
+        env:
+          SSH_KEY: ${{ secrets.private-deps-ssh-key }}
+          PRIVATE_DEPS: ${{ inputs.private-deps }}
+        run: |
+          [ -n "$SSH_KEY" ] || { echo "::error::private-deps is set but the private-deps-ssh-key secret is empty"; exit 1; }
+          dir="$(cd "$RUNNER_TEMP" && pwd)/private-deps-ssh"
+          mkdir -p "$dir" && chmod 700 "$dir"
+          (umask 077 && printf '%s\n' "$SSH_KEY" > "$dir/key")
+          # GitHub's published SSH host keys (api.github.com/meta), pinned: no trust on first use.
+          {
+            echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            echo "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg="
+          } > "$dir/known_hosts"
+          ssh_cmd="ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+          echo "GIT_SSH_COMMAND=$ssh_cmd" >> "$GITHUB_ENV"
+          read -ra urls <<< "$PRIVATE_DEPS"
+          for url in "${urls[@]}"; do
+            re='^git\+https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\.git@[A-Za-z0-9_./-]+$'
+            [[ "$url" =~ $re ]] || { echo "::error::private-deps entry must be git+https://github.com/OWNER/REPO.git@REF: $url"; exit 1; }
+            repo="${BASH_REMATCH[1]}"
+            # Only this repo's exact .git URL goes over SSH (".git" stops a prefix match on REPO-other).
+            git config --global "url.git@github.com:${repo}.git.insteadOf" "https://github.com/${repo}.git"
+            GIT_SSH_COMMAND="$ssh_cmd" git ls-remote "https://github.com/${repo}.git" HEAD > /dev/null \
+              || { echo "::error::the deploy key cannot read ${repo}"; exit 1; }
+          done
       - name: Read the distribution name
         # Runner's system Python (3.12) has tomllib; the matrix minimum may not.
         run: |
