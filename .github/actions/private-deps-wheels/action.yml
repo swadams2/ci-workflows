@@ -1,0 +1,82 @@
+# Build private GitHub dependencies into pure wheels WITH their Git LFS content, once per resolved
+# commit, and cache them under `key` in ./private-wheels. Run private-deps-ssh first. Matrix jobs then
+# restore the cache by `key` (actions/cache/restore, enableCrossOsArchive) instead of cloning, so LFS
+# objects are fetched only on a cache miss. Workflows in one repo that list the same deps share the
+# cache entry.
+name: private-deps-wheels
+description: Build + cache private GitHub dependencies as pure wheels with LFS content, keyed per commit
+
+inputs:
+  private-deps:
+    description: "Space-separated private GitHub deps, each git+https://github.com/OWNER/REPO.git@REF"
+    required: true
+  python-version:
+    description: "Python used to build the wheels on a cache miss"
+    required: true
+
+outputs:
+  key:
+    description: "Cache key of ./private-wheels (restore it with enableCrossOsArchive: true)"
+    value: ${{ steps.ids.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    - id: ids
+      name: Key the cache on the resolved commits
+      shell: bash
+      env:
+        PRIVATE_DEPS: ${{ inputs.private-deps }}
+      run: |
+        read -ra urls <<< "$PRIVATE_DEPS"
+        : > "$RUNNER_TEMP/private-deps-resolved.txt"
+        for url in "${urls[@]}"; do
+          repo_url="${url#git+}"; ref="${repo_url##*@}"; repo_url="${repo_url%@*}"
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "$url $ref" >> "$RUNNER_TEMP/private-deps-resolved.txt"
+          else
+            lines=$(git ls-remote "$repo_url" "$ref" "${ref}^{}" "refs/tags/${ref}^{}" | sort)
+            [ -n "$lines" ] || { echo "::error::ref ${ref} not found in ${repo_url}"; exit 1; }
+            printf '%s\n%s\n' "$url" "$lines" >> "$RUNNER_TEMP/private-deps-resolved.txt"
+          fi
+        done
+        cat "$RUNNER_TEMP/private-deps-resolved.txt"
+        echo "key=private-wheels-v1-$(sha256sum "$RUNNER_TEMP/private-deps-resolved.txt" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: private-wheels
+        key: ${{ steps.ids.outputs.key }}
+        enableCrossOsArchive: true
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Build the wheels with LFS content (cache miss only)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        PRIVATE_DEPS: ${{ inputs.private-deps }}
+      run: |
+        unset GIT_LFS_SKIP_SMUDGE
+        git lfs install
+        read -ra urls <<< "$PRIVATE_DEPS"
+        for url in "${urls[@]}"; do
+          python -m pip wheel --no-deps --no-cache-dir -w private-wheels "$url"
+        done
+        # One wheel serves every OS in the matrix, so it must be pure; and an LFS pointer file in
+        # place of real content means smudge didn't run.
+        python - private-wheels <<'PY'
+        import pathlib, sys, zipfile
+        bad = []
+        for wheel in pathlib.Path(sys.argv[1]).glob("*.whl"):
+            if not wheel.name.endswith("-none-any.whl"):
+                bad.append(f"{wheel.name}: not a pure wheel")
+            with zipfile.ZipFile(wheel) as zf:
+                for member in zf.infolist():
+                    if zf.open(member).read(64).startswith(b"version https://git-lfs.github.com/spec/"):
+                        bad.append(f"{wheel.name}: LFS pointer {member.filename}")
+        for line in bad:
+            print(f"::error::{line}")
+        sys.exit(1 if bad else 0)
+        PY

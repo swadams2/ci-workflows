@@ -1,0 +1,46 @@
+# SSH access to private GitHub dependencies through a read-only deploy key. Writes the key and
+# GitHub's pinned host keys under RUNNER_TEMP, sets git's core.sshCommand, and rewrites only each
+# listed repo's exact .git HTTPS URL to SSH (never all of github.com). Fails fast if the key can't
+# read a repo. Used by clean-install.yml and by callers' own workflows (e.g. an end-to-end job).
+name: private-deps-ssh
+description: SSH access to private GitHub deps via a read-only deploy key, scoped to their exact URLs
+
+inputs:
+  ssh-key:
+    description: "Read-only deploy key (private half) that can read every repo in private-deps"
+    required: true
+  private-deps:
+    description: "Space-separated private GitHub deps, each git+https://github.com/OWNER/REPO.git@REF"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: SSH access to the private dependencies
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-key }}
+        PRIVATE_DEPS: ${{ inputs.private-deps }}
+      run: |
+        [ -n "$SSH_KEY" ] || { echo "::error::private-deps is set but the deploy key is empty"; exit 1; }
+        dir="$(cd "$RUNNER_TEMP" && pwd)/private-deps-ssh"
+        mkdir -p "$dir" && chmod 700 "$dir"
+        (umask 077 && printf '%s\n' "$SSH_KEY" > "$dir/key")
+        # GitHub's published SSH host keys (api.github.com/meta), pinned: no trust on first use.
+        {
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+          echo "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg="
+        } > "$dir/known_hosts"
+        ssh_cmd="ssh -i $dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$dir/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+        # Git config, not GITHUB_ENV: later steps' git (and pip's git clones) pick it up all the same.
+        git config --global core.sshCommand "$ssh_cmd"
+        read -ra urls <<< "$PRIVATE_DEPS"
+        for url in "${urls[@]}"; do
+          re='^git\+https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\.git@[A-Za-z0-9_./-]+$'
+          [[ "$url" =~ $re ]] || { echo "::error::private-deps entry must be git+https://github.com/OWNER/REPO.git@REF: $url"; exit 1; }
+          repo="${BASH_REMATCH[1]}"
+          # Only this repo's exact .git URL goes over SSH (".git" stops a prefix match on REPO-other).
+          git config --global "url.git@github.com:${repo}.git.insteadOf" "https://github.com/${repo}.git"
+          GIT_SSH_COMMAND="$ssh_cmd" git ls-remote "https://github.com/${repo}.git" HEAD > /dev/null \
+            || { echo "::error::the deploy key cannot read ${repo}"; exit 1; }
+        done
